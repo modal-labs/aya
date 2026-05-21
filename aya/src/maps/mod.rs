@@ -58,7 +58,12 @@ use std::{
     ptr,
 };
 
-use aya_obj::{EbpfSectionKind, InvalidTypeBinding, generated::bpf_map_type, parse_map_info};
+use aya_obj::{
+    EbpfSectionKind, InvalidTypeBinding,
+    generated::bpf_map_type,
+    maps::{LegacyMap, PinningType as ObjPinningType, bpf_map_def},
+    parse_map_info,
+};
 use thiserror::Error;
 
 use crate::{
@@ -593,6 +598,37 @@ pub struct MapData {
 }
 
 impl MapData {
+    /// Creates a standalone map (`BPF_MAP_CREATE`) with the given shape,
+    /// outside any ELF load. The returned [`MapData`] owns the only FD;
+    /// the kernel map lives as long as some FD to it exists. Useful for
+    /// sharing a map across multiple [`EbpfLoader::map_replace`] calls
+    /// without filesystem pinning.
+    pub fn create_unpinned(
+        name: &str,
+        map_type: bpf_map_type,
+        key_size: u32,
+        value_size: u32,
+        max_entries: u32,
+        flags: u32,
+    ) -> Result<Self, MapError> {
+        let obj = aya_obj::Map::Legacy(LegacyMap {
+            def: bpf_map_def {
+                map_type: map_type as u32,
+                key_size,
+                value_size,
+                max_entries,
+                map_flags: flags,
+                id: 0,
+                pinning: ObjPinningType::None,
+            },
+            section_index: 0,
+            section_kind: EbpfSectionKind::Maps,
+            symbol_index: None,
+            data: Vec::new(),
+        });
+        Self::create(obj, name, None)
+    }
+
     /// Creates a new map with the provided `name`
     pub fn create(
         mut obj: aya_obj::Map,
