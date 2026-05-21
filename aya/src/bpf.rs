@@ -125,6 +125,8 @@ pub struct EbpfLoader<'a> {
     // Map pin path overrides the pin path of the map that matches the provided name before
     // it is created.
     map_pin_path_by_name: HashMap<&'a str, Cow<'a, Path>>,
+    // Caller-supplied maps that replace the map of the same name from the object file.
+    map_replacements: HashMap<&'a str, MapData>,
 
     extensions: HashSet<&'a str>,
     verifier_log_level: VerifierLogLevel,
@@ -165,6 +167,7 @@ impl<'a> EbpfLoader<'a> {
             globals: HashMap::new(),
             max_entries: HashMap::new(),
             map_pin_path_by_name: HashMap::new(),
+            map_replacements: HashMap::new(),
             extensions: HashSet::new(),
             verifier_log_level: VerifierLogLevel::default(),
             allow_unsupported_maps: false,
@@ -342,6 +345,39 @@ impl<'a> EbpfLoader<'a> {
         self
     }
 
+    /// Replace the map named `name` with a caller-supplied [`MapData`].
+    ///
+    /// During loading, instead of creating the map referenced by `name` in the object
+    /// file, the loader will use the supplied [`MapData`] and patch its file descriptor
+    /// into the program's bytecode. Use [`MapData::from_fd`], [`MapData::from_pin`],
+    /// [`MapData::from_id`], or [`MapData::create`] to construct one.
+    ///
+    /// The replacement map must be compatible with what the program expects: `map_type`,
+    /// `key_size`, and `value_size` must match. `max_entries` of the supplied map must
+    /// be at least what the object declares. `.rodata`/`.data`/`.bss` data maps are not
+    /// eligible for replacement.
+    ///
+    /// Calling this multiple times with the same `name` overwrites the previous
+    /// replacement; last one wins. Settings applied via [`EbpfLoader::map_max_entries`]
+    /// and [`EbpfLoader::map_pin_path`] for the same `name` are ignored when a
+    /// replacement is supplied.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use aya::{EbpfLoader, maps::MapData};
+    ///
+    /// let shared = MapData::from_pin("/sys/fs/bpf/my_shared_map")?;
+    /// let bpf = EbpfLoader::new()
+    ///     .map_replace("MY_MAP", shared)
+    ///     .load_file("file.o")?;
+    /// # Ok::<(), aya::EbpfError>(())
+    /// ```
+    pub fn map_replace(&mut self, name: &'a str, map: MapData) -> &mut Self {
+        self.map_replacements.insert(name, map);
+        self
+    }
+
     /// Treat the provided program as an [`Extension`]
     ///
     /// When attempting to load the program with the provided `name`
@@ -417,6 +453,7 @@ impl<'a> EbpfLoader<'a> {
     /// # Ok::<(), aya::EbpfError>(())
     /// ```
     pub fn load(&mut self, data: &[u8]) -> Result<Ebpf, EbpfError> {
+        let mut map_replacements = std::mem::take(&mut self.map_replacements);
         let Self {
             btf,
             default_map_pin_directory,
@@ -426,6 +463,7 @@ impl<'a> EbpfLoader<'a> {
             verifier_log_level,
             allow_unsupported_maps,
             map_pin_path_by_name,
+            map_replacements: _,
         } = self;
         let mut obj = Object::parse(data)?;
         obj.patch_map_data(globals.clone())?;
@@ -523,6 +561,19 @@ impl<'a> EbpfLoader<'a> {
             if let Some(value_size) = value_size_override(map_type) {
                 obj.set_value_size(value_size)
             }
+
+            // Replacement maps short-circuit creation, pinning, and finalize().
+            if let Some(mut replacement) = map_replacements.remove(name.as_str()) {
+                check_reuse_compat(&name, &obj, &replacement)?;
+                // Graft the ELF's section/symbol metadata onto the replacement so
+                // map relocations can find this entry by symbol_index. The
+                // replacement's `obj` (built from MapInfo or constructed from raw
+                // params) has no section/symbol information.
+                replacement.set_obj(obj);
+                maps.insert(name, replacement);
+                continue;
+            }
+
             let btf_fd = btf_fd.as_deref().map(|fd| fd.as_fd());
             let mut map = if let Some(pin_path) = map_pin_path_by_name.get(name.as_str()) {
                 MapData::create_pinned_by_name(pin_path, obj, &name, btf_fd)?
@@ -748,6 +799,65 @@ impl<'a> EbpfLoader<'a> {
 
         Ok(Ebpf { maps, programs })
     }
+}
+
+/// Verifies that a caller-supplied replacement map is compatible with the map definition
+/// the loaded object expects. Rejects data-section reuse (`.rodata`/`.data`/`.bss`) since
+/// those are populated by [`MapData::finalize`] and reusing them would either skip the
+/// initialization or stomp on shared state.
+fn check_reuse_compat(
+    name: &str,
+    expected: &aya_obj::Map,
+    replacement: &MapData,
+) -> Result<(), MapError> {
+    match expected.section_kind() {
+        EbpfSectionKind::Bss | EbpfSectionKind::Data | EbpfSectionKind::Rodata => {
+            return Err(MapError::IncompatibleReusedMap {
+                name: name.into(),
+                reason: "data-section maps (.bss/.data/.rodata) cannot be reused",
+                expected_map_type: expected.map_type(),
+                expected_key_size: expected.key_size(),
+                expected_value_size: expected.value_size(),
+                actual_map_type: replacement.obj().map_type(),
+                actual_key_size: replacement.obj().key_size(),
+                actual_value_size: replacement.obj().value_size(),
+            });
+        }
+        EbpfSectionKind::Maps
+        | EbpfSectionKind::BtfMaps
+        | EbpfSectionKind::Undefined
+        | EbpfSectionKind::Program
+        | EbpfSectionKind::Text
+        | EbpfSectionKind::License
+        | EbpfSectionKind::Version
+        | EbpfSectionKind::Btf
+        | EbpfSectionKind::BtfExt => {}
+    }
+
+    let got = replacement.obj();
+    let mismatch = |reason| MapError::IncompatibleReusedMap {
+        name: name.into(),
+        reason,
+        expected_map_type: expected.map_type(),
+        expected_key_size: expected.key_size(),
+        expected_value_size: expected.value_size(),
+        actual_map_type: got.map_type(),
+        actual_key_size: got.key_size(),
+        actual_value_size: got.value_size(),
+    };
+    if got.map_type() != expected.map_type() {
+        return Err(mismatch("map_type mismatch"));
+    }
+    if got.key_size() != expected.key_size() {
+        return Err(mismatch("key_size mismatch"));
+    }
+    if got.value_size() != expected.value_size() {
+        return Err(mismatch("value_size mismatch"));
+    }
+    if got.max_entries() < expected.max_entries() {
+        return Err(mismatch("max_entries of supplied map is smaller than expected"));
+    }
+    Ok(())
 }
 
 fn parse_map(

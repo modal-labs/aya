@@ -197,6 +197,31 @@ pub enum MapError {
         /// The map type
         map_type: bpf_map_type,
     },
+
+    /// Caller-supplied map is incompatible with the program's expectation.
+    #[error(
+        "incompatible reused map `{name}`: {reason} \
+         (expected map_type={expected_map_type}, key_size={expected_key_size}, value_size={expected_value_size}; \
+         got map_type={actual_map_type}, key_size={actual_key_size}, value_size={actual_value_size})"
+    )]
+    IncompatibleReusedMap {
+        /// The map name.
+        name: String,
+        /// What part of the compatibility check failed.
+        reason: &'static str,
+        /// Map type expected by the loaded object.
+        expected_map_type: u32,
+        /// Key size expected by the loaded object.
+        expected_key_size: u32,
+        /// Value size expected by the loaded object.
+        expected_value_size: u32,
+        /// Map type of the caller-supplied map.
+        actual_map_type: u32,
+        /// Key size of the caller-supplied map.
+        actual_key_size: u32,
+        /// Value size of the caller-supplied map.
+        actual_value_size: u32,
+    },
 }
 
 impl From<InvalidTypeBinding<u32>> for MapError {
@@ -761,6 +786,14 @@ impl MapData {
     pub(crate) const fn obj(&self) -> &aya_obj::Map {
         let Self { obj, fd: _ } = self;
         obj
+    }
+
+    /// Replace this map's metadata (`aya_obj::Map`) while preserving its file
+    /// descriptor. Used by the loader to graft the ELF's section/symbol
+    /// metadata onto a caller-supplied map so map relocations resolve to the
+    /// correct symbol.
+    pub(crate) fn set_obj(&mut self, obj: aya_obj::Map) {
+        self.obj = obj;
     }
 
     /// Returns the kernel's information about the loaded map.
