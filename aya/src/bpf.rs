@@ -116,7 +116,7 @@ pub fn features() -> &'static Features {
 /// ```
 #[derive(Debug)]
 pub struct EbpfLoader<'a> {
-    btf: Option<Cow<'a, Btf>>,
+    btf: TargetBtf<'a>,
     default_map_pin_directory: Option<PathBuf>,
     globals: HashMap<&'a str, (&'a [u8], bool)>,
     // Max entries overrides the max_entries field of the map that matches the provided name
@@ -131,6 +131,13 @@ pub struct EbpfLoader<'a> {
     extensions: HashSet<&'a str>,
     verifier_log_level: VerifierLogLevel,
     allow_unsupported_maps: bool,
+}
+
+#[derive(Debug)]
+enum TargetBtf<'a> {
+    /// Read [`Btf::from_sys_fs`] when the object has BTF relocations.
+    System,
+    Parsed(Option<Cow<'a, Btf>>),
 }
 
 /// Builder style API for advanced loading of eBPF programs.
@@ -162,7 +169,7 @@ impl<'a> EbpfLoader<'a> {
     /// Creates a new loader instance.
     pub fn new() -> Self {
         Self {
-            btf: Btf::from_sys_fs().ok().map(Cow::Owned),
+            btf: TargetBtf::System,
             default_map_pin_directory: None,
             globals: HashMap::new(),
             max_entries: HashMap::new(),
@@ -176,7 +183,8 @@ impl<'a> EbpfLoader<'a> {
 
     /// Sets the target [BTF](Btf) info.
     ///
-    /// The loader defaults to loading `BTF` info using [`Btf::from_sys_fs`].
+    /// The loader defaults to loading `BTF` info using [`Btf::from_sys_fs`]
+    /// when the object has BTF relocations.
     /// Use this method if you want to load `BTF` from a custom location or
     /// pass `None` to disable `BTF` relocations entirely.
     /// # Example
@@ -192,7 +200,7 @@ impl<'a> EbpfLoader<'a> {
     /// # Ok::<(), aya::EbpfError>(())
     /// ```
     pub fn btf(&mut self, btf: Option<&'a Btf>) -> &mut Self {
-        self.btf = btf.map(Cow::Borrowed);
+        self.btf = TargetBtf::Parsed(btf.map(Cow::Borrowed));
         self
     }
 
@@ -532,8 +540,18 @@ impl<'a> EbpfLoader<'a> {
             None
         };
 
-        if let Some(btf) = &btf {
-            obj.relocate_btf(btf)?;
+        if obj.has_btf_relocations() {
+            let system_btf;
+            let btf = match btf {
+                TargetBtf::System => {
+                    system_btf = Btf::from_sys_fs().ok();
+                    system_btf.as_ref()
+                }
+                TargetBtf::Parsed(btf) => btf.as_deref(),
+            };
+            if let Some(btf) = btf {
+                obj.relocate_btf(btf)?;
+            }
         }
         let mut maps = HashMap::new();
         for (name, mut obj) in obj.maps.drain() {
@@ -1044,9 +1062,7 @@ impl Ebpf {
     /// # Ok::<(), aya::EbpfError>(())
     /// ```
     pub fn load_file<P: AsRef<Path>>(path: P) -> Result<Self, EbpfError> {
-        EbpfLoader::new()
-            .btf(Btf::from_sys_fs().ok().as_ref())
-            .load_file(path)
+        EbpfLoader::new().load_file(path)
     }
 
     /// Loads eBPF bytecode from a buffer.
@@ -1073,9 +1089,7 @@ impl Ebpf {
     /// # Ok::<(), aya::EbpfError>(())
     /// ```
     pub fn load(data: &[u8]) -> Result<Self, EbpfError> {
-        EbpfLoader::new()
-            .btf(Btf::from_sys_fs().ok().as_ref())
-            .load(data)
+        EbpfLoader::new().load(data)
     }
 
     /// Returns a reference to the map with the given name.
